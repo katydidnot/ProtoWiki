@@ -142,7 +142,7 @@ export async function getEditTravelMap(username: string): Promise<TravelResult> 
   const allTitles = new Set<string>()
 
   const ucstart = new Date().toISOString()
-  const ucend = getISODateDaysAgo(30)
+  const ucend = getISODateDaysAgo(25)
 
   let uccontinue: string | undefined
 
