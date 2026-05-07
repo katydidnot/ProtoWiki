@@ -20,15 +20,44 @@ type TravelResult = {
   >
 }
 
+// --- Caches to prevent redundant API calls ---
+const spokenInCache = new Map<string, string[]>()
+const countryGeoCache = new Map<string, FeatureCollection | null>()
+const titleQidCache = new Map<string, string[]>()
+const sitelinkCache = new Map<string, string[]>()
+
 function sleep(ms: number) {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
-async function safeFetch(url: string, delay = 600) {
-  await sleep(delay)
-  const res = await fetch(url)
-  if (!res.ok) console.warn("HTTP error:", res.status, url)
-  return res
+async function safeFetch(
+  url: string,
+  options: RequestInit = {},
+  retries = 3,
+  delay = 800
+): Promise<Response> {
+  let lastError: unknown
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      if (attempt > 0) {
+        await sleep(delay * attempt)
+      }
+
+      const res = await fetch(url, options)
+
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`)
+      }
+
+      return res
+    } catch (err) {
+      lastError = err
+      console.warn(`Fetch failed (${attempt + 1}/${retries + 1})`, url, err)
+    }
+  }
+
+  throw lastError
 }
 
 function getISODateDaysAgo(days: number): string {
@@ -57,32 +86,26 @@ function setCache(key: string, value: any) {
 async function getPageViewsSince(title: string, startDateISO: string) {
   try {
     const encoded = encodeURIComponent(title.replace(/ /g, "_"))
-
-    const format = (d: Date) =>
-      d.toISOString().split("T")[0].replace(/-/g, "")
+    const format = (d: Date) => d.toISOString().split("T")[0].replace(/-/g, "")
 
     const start = new Date(startDateISO)
-    const end = new Date()
-
     const url =
       `https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article/` +
-      `en.wikipedia/all-access/user/${encoded}/daily/${format(start)}/${format(end)}`
+      `en.wikipedia/all-access/user/${encoded}/daily/${format(start)}/${format(new Date())}`
 
     const res = await fetch(url)
     if (!res.ok) return null
 
     const data = await res.json()
-
-    return (
-      data.items?.reduce((sum: number, i: any) => sum + (i.views || 0), 0) ??
-      null
-    )
+    return data.items?.reduce((sum: number, i: any) => sum + (i.views || 0), 0) ?? null
   } catch {
     return null
   }
 }
 
 async function getQidsFromTitle(title: string): Promise<string[]> {
+  if (titleQidCache.has(title)) return titleQidCache.get(title)!
+
   const res = await fetch(
     `https://en.wikipedia.org/w/api.php?action=query&prop=pageprops&ppprop=wikibase_item&titles=${encodeURIComponent(
       title
@@ -91,13 +114,15 @@ async function getQidsFromTitle(title: string): Promise<string[]> {
 
   const data = await res.json()
   const pages = Object.values(data.query.pages || {}) as any[]
+  const qids = pages.map(p => p.pageprops?.wikibase_item).filter(Boolean)
 
-  return pages
-    .map(p => p.pageprops?.wikibase_item)
-    .filter(Boolean)
+  titleQidCache.set(title, qids)
+  return qids
 }
 
 async function getSitelinkLanguages(qid: string): Promise<string[]> {
+  if (sitelinkCache.has(qid)) return sitelinkCache.get(qid)!
+
   const res = await fetch(
     `https://www.wikidata.org/w/api.php?action=wbgetentities&ids=${qid}&props=sitelinks&format=json&origin=*`
   )
@@ -106,16 +131,24 @@ async function getSitelinkLanguages(qid: string): Promise<string[]> {
   const sitelinks = data.entities?.[qid]?.sitelinks
   if (!sitelinks) return []
 
-  return Object.keys(sitelinks)
+  const langs = Object.keys(sitelinks)
     .filter(k => k.endsWith("wiki"))
     .map(k => k.replace("wiki", ""))
+
+  sitelinkCache.set(qid, langs)
+  return langs
 }
 
-// country geo
 async function getCountryGeometry(qid: string): Promise<FeatureCollection | null> {
+  // Check memory cache first, then localStorage
+  if (countryGeoCache.has(qid)) return countryGeoCache.get(qid)!
+
   const cacheKey = `country:${qid}`
   const cached = getCache<FeatureCollection>(cacheKey)
-  if (cached) return cached
+  if (cached) {
+    countryGeoCache.set(qid, cached)
+    return cached
+  }
 
   const res = await fetch(
     `https://www.wikidata.org/w/api.php?action=wbgetentities&ids=${qid}&props=claims&format=json&origin=*`
@@ -123,10 +156,12 @@ async function getCountryGeometry(qid: string): Promise<FeatureCollection | null
 
   const data = await res.json()
   const entity = data.entities?.[qid]
-
   const coord = entity?.claims?.P625?.[0]?.mainsnak?.datavalue?.value
 
-  if (!coord?.latitude || !coord?.longitude) return null
+  if (!coord?.latitude || !coord?.longitude) {
+    countryGeoCache.set(qid, null)
+    return null
+  }
 
   const result: FeatureCollection = {
     type: "FeatureCollection",
@@ -143,26 +178,35 @@ async function getCountryGeometry(qid: string): Promise<FeatureCollection | null
   }
 
   setCache(cacheKey, result)
+  countryGeoCache.set(qid, result)
   return result
 }
 
 async function getSpokenInCountries(languageQid: string): Promise<string[]> {
-  const res = await fetch(
-    `https://query.wikidata.org/sparql?query=${encodeURIComponent(`
+  if (spokenInCache.has(languageQid)) return spokenInCache.get(languageQid)!
+
+  try {
+    const res = await safeFetch(
+      `https://query.wikidata.org/sparql?query=${encodeURIComponent(`
       SELECT DISTINCT ?country WHERE {
         { ?country wdt:P37 wd:${languageQid}. }
         UNION
         { ?country wdt:P2936 wd:${languageQid}. }
+        ?country wdt:P31/wdt:P279* wd:Q3624078.
       }
       LIMIT 5
     `)}&format=json`
-  )
+    )
+    const data = await res.json()
+    const countries = (data.results.bindings || [])
+      .map((b: any) => b.country.value.split("/").pop())
+      .filter(Boolean)
 
-  const data = await res.json()
-
-  return (data.results.bindings || [])
-    .map((b: any) => b.country.value.split("/").pop())
-    .filter(Boolean)
+    spokenInCache.set(languageQid, countries)
+    return countries
+  }catch (err){
+    console.log("ERRROROROROROR", err)
+  }
 }
 
 export async function getEditTravelMap(
@@ -173,8 +217,9 @@ export async function getEditTravelMap(
   const end = getISODateDaysAgo(days)
 
   let ucContinue: string | undefined
-
   const contribs: any[] = []
+
+  // Fetch user contributions
   do {
     const url = new URL("https://en.wikipedia.org/w/api.php")
     url.searchParams.set("action", "query")
@@ -203,7 +248,6 @@ export async function getEditTravelMap(
 
   const languagePoints: TravelResult["languagePoints"] = {}
   const seenFeatures = new Set<string>()
-
   const allLanguages = new Set<string>()
   let qidCount = 0
 
@@ -217,17 +261,17 @@ export async function getEditTravelMap(
     ])
 
     qidCount += qids.length
-    const languages = new Set<string>()
+    const articleLangs = new Set<string>()
 
     for (const qid of qids) {
       const langs = await getSitelinkLanguages(qid)
       langs.forEach(l => {
-        languages.add(l)
+        articleLangs.add(l)
         allLanguages.add(l)
       })
     }
 
-    for (const lang of languages) {
+    for (const lang of articleLangs) {
       const langQids = languageToQid[lang]
       if (!langQids) continue
 
@@ -241,15 +285,11 @@ export async function getEditTravelMap(
           if (!geo) continue
 
           if (!languagePoints[lang]) {
-            languagePoints[lang] = {
-              type: "FeatureCollection",
-              features: []
-            }
+            languagePoints[lang] = { type: "FeatureCollection", features: [] }
           }
 
           for (const f of geo.features) {
             const key = `${title}-${f.geometry?.coordinates?.join(",")}-${lang}`
-
             if (seenFeatures.has(key)) continue
             seenFeatures.add(key)
 
@@ -269,7 +309,6 @@ export async function getEditTravelMap(
   }
 
   const languagesArr = Array.from(allLanguages)
-
   const languageInfoRes = await safeFetch(
     "https://en.wikipedia.org/w/api.php?action=query&meta=languageinfo&liprop=code|name&format=json&origin=*"
   )
